@@ -1,40 +1,43 @@
 #!/usr/bin/env python3
-"""Document auto-crop + perspective deskew (OpenCV).
+"""Document auto-crop + deskew + enhance + orientation (OpenCV / Tesseract OSD).
 
-Multi-strategy document quad detection with low-light normalization,
-candidate scoring, and no-crop fallback when confidence is low.
-
-Prints a JSON meta line to stdout (applied, method, confidence, reason, …).
+Prints a JSON meta line to stdout.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
+import re
+import shutil
+import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from typing import Optional
 
 import cv2
 import numpy as np
 
-# Reject tiny / garbage quads (old bug: fell back to largest even at ~0.3% area).
-MIN_AREA_RATIO = 0.18
-MAX_AREA_RATIO = 0.96
+MIN_AREA_RATIO = 0.16
+MAX_AREA_RATIO = 0.98
 MIN_CONFIDENCE = 0.42
-MIN_ASPECT = 0.35  # short/long
+MIN_ASPECT = 0.35
 MAX_ASPECT = 2.85
-MIN_SOLIDITY = 0.78
+MIN_SOLIDITY = 0.75
+# Expand detected quad slightly so we don't clip page edges.
+QUAD_MARGIN = 0.018
 
 
 def order_points(pts: np.ndarray) -> np.ndarray:
     rect = np.zeros((4, 2), dtype="float32")
     s = pts.sum(axis=1)
-    rect[0] = pts[np.argmin(s)]  # tl
-    rect[2] = pts[np.argmax(s)]  # br
+    rect[0] = pts[np.argmin(s)]
+    rect[2] = pts[np.argmax(s)]
     diff = np.diff(pts, axis=1)
-    rect[1] = pts[np.argmin(diff)]  # tr
-    rect[3] = pts[np.argmax(diff)]  # bl
+    rect[1] = pts[np.argmin(diff)]
+    rect[3] = pts[np.argmax(diff)]
     return rect
 
 
@@ -60,7 +63,6 @@ def aspect_from_rect(rect: np.ndarray) -> float:
 
 
 def touches_frame_edges(pts: np.ndarray, w: int, h: int, margin: float = 0.015) -> int:
-    """How many of the four sides of the image the quad hugs."""
     mx, my = w * margin, h * margin
     xs, ys = pts[:, 0], pts[:, 1]
     sides = 0
@@ -75,17 +77,29 @@ def touches_frame_edges(pts: np.ndarray, w: int, h: int, margin: float = 0.015) 
     return sides
 
 
+def expand_quad(pts: np.ndarray, img_w: int, img_h: int, margin: float = QUAD_MARGIN) -> np.ndarray:
+    """Push each corner outward from the centroid by `margin` of the diagonal."""
+    ordered = order_points(pts.astype("float32"))
+    c = ordered.mean(axis=0)
+    diag = float(np.linalg.norm([img_w, img_h]))
+    out = []
+    for p in ordered:
+        v = p - c
+        n = float(np.linalg.norm(v)) + 1e-6
+        out.append(p + v / n * (margin * diag))
+    expanded = np.array(out, dtype="float32")
+    expanded[:, 0] = np.clip(expanded[:, 0], 0, img_w - 1)
+    expanded[:, 1] = np.clip(expanded[:, 1], 0, img_h - 1)
+    return order_points(expanded)
+
+
 def normalize_for_detect(bgr: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Return gray, CLAHE gray, and a lightly gamma-lifted gray for low light."""
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
     clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
     norm = clahe.apply(gray)
-    # Mild gamma lift (mean-adaptive): dark frames get stronger boost
     mean = float(norm.mean()) + 1e-6
     gamma = 1.0 if mean >= 90 else max(0.45, mean / 90.0)
-    table = np.array(
-        [((i / 255.0) ** gamma) * 255 for i in range(256)], dtype=np.uint8
-    )
+    table = np.array([((i / 255.0) ** gamma) * 255 for i in range(256)], dtype=np.uint8)
     lifted = cv2.LUT(norm, table)
     return gray, norm, lifted
 
@@ -98,7 +112,7 @@ def _quads_from_binary(mask: np.ndarray, scale: float) -> list[np.ndarray]:
         peri = cv2.arcLength(c, True)
         if peri < 40:
             continue
-        for eps in (0.02, 0.025, 0.03, 0.035):
+        for eps in (0.02, 0.025, 0.03, 0.035, 0.04):
             approx = cv2.approxPolyDP(c, eps * peri, True)
             if len(approx) == 4 and cv2.isContourConvex(approx):
                 pts = approx.reshape(4, 2).astype("float32")
@@ -112,11 +126,19 @@ def _quads_from_binary(mask: np.ndarray, scale: float) -> list[np.ndarray]:
 def _min_area_rect_quad(contour: np.ndarray, scale: float) -> Optional[np.ndarray]:
     if contour is None or len(contour) < 4:
         return None
-    rect = cv2.minAreaRect(contour)
-    box = cv2.boxPoints(rect).astype("float32")
+    box = cv2.boxPoints(cv2.minAreaRect(contour)).astype("float32")
     if scale != 1.0:
         box = box / scale
     return box
+
+
+def merge_page_regions(mask: np.ndarray) -> np.ndarray:
+    """Close gaps between facing pages so one contour covers the whole book."""
+    k = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 15))
+    merged = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=3)
+    k2 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    merged = cv2.dilate(merged, k2, iterations=2)
+    return merged
 
 
 @dataclass
@@ -150,7 +172,6 @@ def score_quad(
     if aspect < MIN_ASPECT or aspect > MAX_ASPECT:
         return None
 
-    # Thinness via min edge vs max edge
     lengths = edge_lengths(ordered)
     if min(lengths) / max(lengths) < 0.22:
         return None
@@ -162,24 +183,21 @@ def score_quad(
         return None
 
     touches = touches_frame_edges(ordered, img_w, img_h)
-    # Full-bleed frame outline is usually wrong for a document on a mat
-    if touches >= 4 and ratio > 0.9:
+    if touches >= 4 and ratio > 0.92:
         return None
 
-    score = ratio * 0.55
-    # Prefer document-like aspects (open book ~0.6–1.4, single page ~0.7)
+    # Prefer larger coverage (full open book) more strongly than v2.
+    score = ratio * 0.72
     if 0.55 <= aspect <= 1.55:
-        score += 0.18
+        score += 0.14
     elif 0.4 <= aspect <= 2.2:
-        score += 0.08
-
-    score += solidity * 0.12
+        score += 0.06
+    score += solidity * 0.1
     if touches <= 1:
-        score += 0.08
+        score += 0.05
     elif touches >= 3:
-        score -= 0.12
+        score -= 0.08
 
-    # Bright-page hint: prefer quads whose interior is brighter than exterior
     if page_hint is not None:
         mask = np.zeros(page_hint.shape, dtype=np.uint8)
         cv2.fillConvexPoly(mask, ordered.astype(np.int32), 255)
@@ -187,13 +205,12 @@ def score_quad(
         outside = page_hint[mask == 0]
         if inside.size and outside.size:
             delta = float(inside.mean()) - float(outside.mean())
-            score += max(-0.1, min(0.22, delta / 80.0))
+            score += max(-0.1, min(0.2, delta / 80.0))
 
-    # Mild method priors
-    if method.startswith("sat") or method.startswith("otsu"):
-        score += 0.03
+    if method.startswith("merged") or method.startswith("sat"):
+        score += 0.04
     if method.startswith("minrect"):
-        score -= 0.04
+        score -= 0.02
 
     return Candidate(
         pts=ordered,
@@ -224,7 +241,6 @@ def gather_masks(lifted: np.ndarray, bgr_small: np.ndarray) -> list[tuple[str, n
     masks.append(("adaptive", thr))
 
     _, otsu = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    # Document pages are usually brighter → keep bright component
     if float(otsu.mean()) > 127:
         otsu = cv2.bitwise_not(otsu)
     otsu = cv2.morphologyEx(otsu, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8), iterations=2)
@@ -232,13 +248,14 @@ def gather_masks(lifted: np.ndarray, bgr_small: np.ndarray) -> list[tuple[str, n
     masks.append(("otsu", otsu))
 
     hsv = cv2.cvtColor(bgr_small, cv2.COLOR_BGR2HSV)
-    # Low-sat bright-ish paper vs dark mat
     sat = hsv[:, :, 1]
     val = hsv[:, :, 2]
-    paper = ((sat < 70) & (val > max(40, int(np.percentile(val, 35))))).astype(np.uint8) * 255
+    paper = ((sat < 80) & (val > max(35, int(np.percentile(val, 30))))).astype(np.uint8) * 255
     paper = cv2.morphologyEx(paper, cv2.MORPH_CLOSE, np.ones((11, 11), np.uint8), iterations=2)
     paper = cv2.morphologyEx(paper, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8), iterations=1)
     masks.append(("sat_paper", paper))
+    masks.append(("merged_paper", merge_page_regions(paper)))
+    masks.append(("merged_otsu", merge_page_regions(otsu)))
 
     return masks
 
@@ -260,24 +277,19 @@ def find_document_quad(
     )
 
     if debug_dir:
-        import os
-
         os.makedirs(debug_dir, exist_ok=True)
         cv2.imwrite(f"{debug_dir}/gray.jpg", gray)
         cv2.imwrite(f"{debug_dir}/clahe.jpg", norm)
         cv2.imwrite(f"{debug_dir}/lifted.jpg", lifted)
 
     candidates: list[Candidate] = []
-    masks = gather_masks(lifted, small)
-    for name, mask in masks:
+    for name, mask in gather_masks(lifted, small):
         if debug_dir:
             cv2.imwrite(f"{debug_dir}/mask_{name}.jpg", mask)
         for pts in _quads_from_binary(mask, scale):
             c = score_quad(pts, w, h, name, page_hint)
             if c:
                 candidates.append(c)
-
-        # minAreaRect fallback on largest contour of this mask
         cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if cnts:
             biggest = max(cnts, key=cv2.contourArea)
@@ -295,7 +307,7 @@ def find_document_quad(
             "candidateCount": 0,
         }
 
-    candidates.sort(key=lambda c: c.score, reverse=True)
+    candidates.sort(key=lambda c: (c.score, c.area_ratio), reverse=True)
     best = candidates[0]
 
     if debug_dir:
@@ -315,15 +327,17 @@ def find_document_quad(
             "candidateCount": len(candidates),
         }
 
-    return best.pts, {
+    expanded = expand_quad(best.pts, w, h, QUAD_MARGIN)
+    return expanded, {
         "reason": "ok",
         "confidence": round(best.score, 4),
         "method": best.method,
-        "areaRatio": round(best.area_ratio, 4),
-        "aspect": round(best.aspect, 4),
+        "areaRatio": round(float(quad_area(expanded) / (w * h)), 4),
+        "aspect": round(aspect_from_rect(expanded), 4),
         "solidity": round(best.solidity, 4),
-        "edgeTouches": best.edge_touches,
+        "edgeTouches": touches_frame_edges(expanded, w, h),
         "candidateCount": len(candidates),
+        "margin": QUAD_MARGIN,
     }
 
 
@@ -335,9 +349,7 @@ def warp_document(image: np.ndarray, rect: np.ndarray) -> np.ndarray:
     height_a = np.linalg.norm(tr - br)
     height_b = np.linalg.norm(tl - bl)
     max_h = max(int(height_a), int(height_b), 1)
-    # Keep a sensible orientation: if warped would be very wide short strip, swap
     if max_w > 0 and max_h / max_w < 0.35 and max_w > max_h:
-        # likely wrong corner order for a tall document — rotate assignment
         rect = order_points(np.array([tl, bl, br, tr], dtype="float32"))
         (tl, tr, br, bl) = rect
         width_a = np.linalg.norm(br - bl)
@@ -354,13 +366,112 @@ def warp_document(image: np.ndarray, rect: np.ndarray) -> np.ndarray:
     return cv2.warpPerspective(image, m, (max_w, max_h))
 
 
-def auto_level(image: np.ndarray) -> np.ndarray:
-    """Optional mild luminance stretch (output only; not used for geometry)."""
-    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+def gray_world_awb(image: np.ndarray) -> np.ndarray:
+    b, g, r = cv2.split(image.astype(np.float32))
+    avg = (float(b.mean()) + float(g.mean()) + float(r.mean())) / 3.0 + 1e-6
+    b *= avg / (float(b.mean()) + 1e-6)
+    g *= avg / (float(g.mean()) + 1e-6)
+    r *= avg / (float(r.mean()) + 1e-6)
+    return cv2.merge([np.clip(b, 0, 255), np.clip(g, 0, 255), np.clip(r, 0, 255)]).astype(
+        np.uint8
+    )
+
+
+def levels_stretch(image: np.ndarray, low_p: float = 1.5, high_p: float = 98.5) -> np.ndarray:
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    lo, hi = np.percentile(gray, (low_p, high_p))
+    scale = 255.0 / max(float(hi - lo), 1.0)
+    lut = np.clip((np.arange(256) - lo) * scale, 0, 255).astype(np.uint8)
+    return cv2.LUT(image, lut)
+
+
+def enhance_document(image: np.ndarray) -> np.ndarray:
+    """Gray-world AWB + mild CLAHE on L + percentile levels stretch."""
+    awb = gray_world_awb(image)
+    lab = cv2.cvtColor(awb, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    l2 = clahe.apply(l)
-    return cv2.cvtColor(cv2.merge([l2, a, b]), cv2.COLOR_LAB2BGR)
+    l = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8)).apply(l)
+    merged = cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
+    return levels_stretch(merged)
+
+
+def rotate_image(image: np.ndarray, degrees: int) -> np.ndarray:
+    d = degrees % 360
+    if d == 0:
+        return image
+    if d == 90:
+        return cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE)
+    if d == 180:
+        return cv2.rotate(image, cv2.ROTATE_180)
+    if d == 270:
+        return cv2.rotate(image, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    return image
+
+
+def heuristic_orientation(image: np.ndarray) -> tuple[int, float]:
+    """Fallback: prefer axis with stronger text-like horizontal runs after binarize."""
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    small = cv2.resize(gray, (min(900, gray.shape[1]), min(900, gray.shape[0])))
+    thr = cv2.adaptiveThreshold(
+        small, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 31, 15
+    )
+    best_angle = 0
+    best_score = -1.0
+    for angle in (0, 90, 180, 270):
+        rot = rotate_image(cv2.cvtColor(thr, cv2.COLOR_GRAY2BGR), angle)
+        g = cv2.cvtColor(rot, cv2.COLOR_BGR2GRAY)
+        # Horizontal projection variance is high when text lines are horizontal.
+        row_sum = g.sum(axis=1).astype(np.float64)
+        score = float(row_sum.std())
+        if score > best_score:
+            best_score = score
+            best_angle = angle
+    return best_angle, best_score
+
+
+def detect_orientation_osd(image: np.ndarray) -> tuple[int, float, str]:
+    """Return (rotate_degrees, confidence, method)."""
+    tesseract = shutil.which("tesseract")
+    if tesseract:
+        with tempfile.TemporaryDirectory(prefix="neor-osd-") as td:
+            path = os.path.join(td, "page.jpg")
+            # Downscale large pages for speed; keep readable text.
+            h, w = image.shape[:2]
+            scale = 1600.0 / max(h, w) if max(h, w) > 1600 else 1.0
+            small = (
+                cv2.resize(image, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+                if scale != 1.0
+                else image
+            )
+            cv2.imwrite(path, small, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+            try:
+                proc = subprocess.run(
+                    [tesseract, path, "stdout", "--psm", "0", "-l", "osd"],
+                    capture_output=True,
+                    text=True,
+                    timeout=20,
+                )
+                text = (proc.stdout or "") + "\n" + (proc.stderr or "")
+                m_rot = re.search(r"Rotate:\s*(\d+)", text)
+                m_conf = re.search(r"Orientation confidence:\s*([0-9.]+)", text)
+                if m_rot:
+                    rot = int(m_rot.group(1)) % 360
+                    if rot in (0, 90, 180, 270):
+                        conf = float(m_conf.group(1)) if m_conf else 0.0
+                        if conf >= 0.5 or rot != 0:
+                            return rot, conf, "tesseract_osd"
+            except (subprocess.TimeoutExpired, OSError, ValueError):
+                pass
+
+    angle, score = heuristic_orientation(image)
+    return angle, float(score), "heuristic_projection"
+
+
+def sharpness_laplacian(image: np.ndarray) -> float:
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    h, w = gray.shape
+    region = gray[h // 5 : 4 * h // 5, w // 5 : 4 * w // 5]
+    return float(cv2.Laplacian(region, cv2.CV_64F).var())
 
 
 def process(
@@ -368,7 +479,8 @@ def process(
     path_out: str,
     auto_crop: bool,
     deskew: bool,
-    auto_level_out: bool = False,
+    enhance: bool = True,
+    rotate: str = "auto",
     debug_dir: Optional[str] = None,
 ) -> dict:
     image = cv2.imread(path_in, cv2.IMREAD_COLOR)
@@ -388,6 +500,11 @@ def process(
     confidence = 0.0
     detect_meta: dict = {}
     out = image
+    rotation_applied = 0
+    rotation_detected = 0
+    rotation_confidence = 0.0
+    rotation_method = "none"
+    enhanced = False
 
     if auto_crop or deskew:
         quad, detect_meta = find_document_quad(image, debug_dir=debug_dir)
@@ -400,11 +517,45 @@ def process(
             reason = "ok"
         else:
             method = "no_crop"
-            # keep original
 
-    if auto_level_out:
-        out = auto_level(out)
-        method = f"{method}+auto_level" if applied else "auto_level_only"
+    # Enhance before OSD so orientation is reliable on dark UVC frames.
+    if enhance:
+        out = enhance_document(out)
+        enhanced = True
+        method = f"{method}+enhance" if method != "none" else "enhance"
+
+    # Orientation
+    rot_mode = (rotate or "none").strip().lower()
+    if rot_mode == "auto" and (auto_crop or deskew or enhance):
+        rotation_detected, rotation_confidence, rotation_method = detect_orientation_osd(out)
+        rotation_applied = rotation_detected
+    elif rot_mode in ("0", "90", "180", "270"):
+        rotation_applied = int(rot_mode)
+        rotation_detected = rotation_applied
+        rotation_method = "manual"
+        rotation_confidence = 1.0
+    elif rot_mode in ("none", "off", ""):
+        rotation_applied = 0
+    else:
+        return {
+            "ok": False,
+            "error": f"invalid rotate: {rotate}",
+            "applied": False,
+            "reason": "invalid_rotate",
+        }
+
+    if rotation_applied:
+        out = rotate_image(out, rotation_applied)
+        method = f"{method}+rot{rotation_applied}"
+
+    sharp = sharpness_laplacian(out)
+    # Rough guidance thresholds on enhanced page-sized images.
+    if sharp >= 400:
+        focus_note = "ok"
+    elif sharp >= 120:
+        focus_note = "soft"
+    else:
+        focus_note = "blurry"
 
     ext = path_out.lower().rsplit(".", 1)[-1]
     params: list[int] = []
@@ -418,13 +569,19 @@ def process(
         "method": method,
         "confidence": round(confidence, 4),
         "reason": reason,
+        "enhanced": enhanced,
+        "rotation": rotation_applied,
+        "rotationDetected": rotation_detected,
+        "rotationConfidence": round(float(rotation_confidence), 4),
+        "rotationMethod": rotation_method,
+        "sharpness": round(sharp, 2),
+        "focusNote": focus_note,
         "sourceWidth": src_w,
         "sourceHeight": src_h,
         "width": out_w,
         "height": out_h,
         "autoCrop": auto_crop,
         "deskew": deskew,
-        "autoLevel": auto_level_out,
         "detect": detect_meta,
     }
 
@@ -435,17 +592,34 @@ def main() -> int:
     p.add_argument("--output", required=True)
     p.add_argument("--auto-crop", action="store_true")
     p.add_argument("--deskew", action="store_true")
-    p.add_argument("--auto-level", action="store_true")
+    p.add_argument("--enhance", action="store_true")
+    p.add_argument("--no-enhance", action="store_true")
+    p.add_argument(
+        "--rotate",
+        default="auto",
+        help="auto|0|90|180|270|none — default auto when cropping/enhancing",
+    )
     p.add_argument("--debug-dir", default=None)
     args = p.parse_args()
     auto = args.auto_crop or args.deskew
     deskew = args.deskew or args.auto_crop
+    if args.no_enhance:
+        enhance = False
+    elif args.enhance:
+        enhance = True
+    else:
+        # Default ON when any document processing is requested.
+        enhance = auto
+    rotate = args.rotate
+    if rotate == "auto" and not (auto or enhance):
+        rotate = "none"
     meta = process(
         args.input,
         args.output,
         auto,
         deskew,
-        auto_level_out=args.auto_level,
+        enhance=enhance,
+        rotate=rotate,
         debug_dir=args.debug_dir,
     )
     print(json.dumps(meta))

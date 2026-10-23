@@ -181,9 +181,20 @@
             <option value="png">png</option>
           </select>
         </label>
-        <label><input type="checkbox" id="autoCrop" /> autoCrop</label>
-        <label><input type="checkbox" id="deskew" /> deskew</label>
-        <label><input type="checkbox" id="autoLevel" /> autoLevel</label>
+        <label><input type="checkbox" id="autoCrop" checked /> autoCrop</label>
+        <label><input type="checkbox" id="deskew" checked /> deskew</label>
+        <label><input type="checkbox" id="enhance" checked /> enhance (AWB)</label>
+        <label><input type="checkbox" id="raw" /> raw (без enhance)</label>
+        <label>rotate
+          <select id="rotate">
+            <option value="auto" selected>auto</option>
+            <option value="0">0</option>
+            <option value="90">90</option>
+            <option value="180">180</option>
+            <option value="270">270</option>
+            <option value="none">none</option>
+          </select>
+        </label>
         <label>warmupMs <input id="warmupMs" type="text" value="1800" style="min-width:5rem" /></label>
       </div>
       <div class="row">
@@ -232,7 +243,9 @@
       const format = $("format").value;
       const autoCrop = $("autoCrop").checked;
       const deskew = $("deskew").checked;
-      const autoLevel = $("autoLevel").checked;
+      const enhance = $("enhance").checked;
+      const raw = $("raw").checked;
+      const rotate = $("rotate").value;
       const warmupRaw = $("warmupMs").value.trim();
       const warmupMs = warmupRaw === "" ? undefined : Number.parseInt(warmupRaw, 10);
       const msg = $("captureMsg");
@@ -240,7 +253,7 @@
       msg.textContent = "Зйомка…";
       const preview = $("preview");
       try {
-        const body = { format, autoCrop, deskew, autoLevel };
+        const body = { format, autoCrop, deskew, enhance, raw, rotate };
         if (Number.isFinite(warmupMs) && warmupMs >= 0) body.warmupMs = warmupMs;
         const r = await fetch("/api/v1/devices/" + encodeURIComponent(serial) + "/capture", {
           method: "POST",
@@ -271,12 +284,22 @@
         const reason = r.headers.get("X-Postprocess-Reason");
         const lum = r.headers.get("X-Capture-Mean-Luminance");
         const warm = r.headers.get("X-Capture-Warmup-Ms");
+        const backend = r.headers.get("X-Capture-Backend");
+        const enh = r.headers.get("X-Postprocess-Enhanced");
+        const rot = r.headers.get("X-Postprocess-Rotation");
+        const sharp = r.headers.get("X-Postprocess-Sharpness");
+        const focus = r.headers.get("X-Postprocess-Focus");
         const parts = [
           "OK",
           blob.type,
           w && h ? w + "×" + h : null,
+          backend ? "via=" + backend : null,
           lum ? "luma=" + lum : null,
           warm != null && warm !== "" ? "warmup=" + warm + "ms" : null,
+          enh === "true" ? "enhance=on" : enhance || autoCrop ? "enhance=off" : null,
+          rot != null && rot !== "" ? "rot=" + rot + "°" : null,
+          sharp ? "sharp=" + sharp : null,
+          focus ? "focus=" + focus : null,
         ];
         if (applied === "true") {
           parts.push("crop=yes", method, conf ? "conf=" + conf : null);

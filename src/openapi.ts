@@ -249,11 +249,25 @@ export function buildOpenApi(opts: { title: string; version: string }) {
               description:
                 "Perspective straighten; same pipeline as autoCrop when either is true",
             },
+            enhance: {
+              type: "boolean",
+              description:
+                "Gray-world AWB + levels stretch. Default ON when autoCrop/deskew. Set false or raw=true for unenhanced.",
+            },
             autoLevel: {
               type: "boolean",
+              description: "Legacy alias of enhance",
+            },
+            raw: {
+              type: "boolean",
               default: false,
+              description: "Skip enhancement (geometry/rotate only)",
+            },
+            rotate: {
+              type: "string",
+              enum: ["auto", "0", "90", "180", "270", "none"],
               description:
-                "Optional CLAHE luminance stretch on the output image (default off)",
+                "Text orientation. Default auto when autoCrop is on (Tesseract OSD)",
             },
             warmupMs: {
               type: "integer",
@@ -286,6 +300,8 @@ export function buildOpenApi(opts: { title: string; version: string }) {
             capture: {
               type: "object",
               properties: {
+                backend: { type: "string", enum: ["imagesnap", "ffmpeg"] },
+                pixelFormat: { type: "string", nullable: true },
                 warmupMs: { type: "integer" },
                 warmupFrames: { type: "integer" },
                 meanLuminance: { type: "number", nullable: true },
@@ -299,6 +315,13 @@ export function buildOpenApi(opts: { title: string; version: string }) {
                 method: { type: "string" },
                 confidence: { type: "number" },
                 reason: { type: "string" },
+                enhanced: { type: "boolean" },
+                rotation: { type: "integer" },
+                rotationDetected: { type: "integer" },
+                rotationConfidence: { type: "number" },
+                rotationMethod: { type: "string" },
+                sharpness: { type: "number" },
+                focusNote: { type: "string" },
                 sourceWidth: { type: "integer" },
                 sourceHeight: { type: "integer" },
               },

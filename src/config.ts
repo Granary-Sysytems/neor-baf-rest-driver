@@ -5,6 +5,10 @@ export type AppConfig = {
   deviceUsbSerial: string | null;
   deviceNameMatch: string;
   ffmpegPath: string;
+  imagesnapPath: string;
+  /** auto = prefer imagesnap (correct color @ 2592x1944), else ffmpeg */
+  captureBackend: "auto" | "imagesnap" | "ffmpeg";
+  capturePixelFormat: string;
   captureDefaultWidth: number;
   captureDefaultHeight: number;
   captureFramerate: number;
@@ -31,9 +35,18 @@ export function loadConfig(): AppConfig {
     deviceUsbSerial: process.env.DEVICE_USB_SERIAL?.trim() || "SN0001",
     deviceNameMatch: process.env.DEVICE_NAME_MATCH ?? "USB",
     ffmpegPath: process.env.FFMPEG_PATH ?? "ffmpeg",
-    // 2592x1944 is advertised but hangs on this NW 500 via AVFoundation; 2560x1440 works.
-    captureDefaultWidth: intEnv("CAPTURE_DEFAULT_WIDTH", 2560),
-    captureDefaultHeight: intEnv("CAPTURE_DEFAULT_HEIGHT", 1440),
+    imagesnapPath: process.env.IMAGESNAP_PATH ?? "imagesnap",
+    captureBackend: (() => {
+      const raw = (process.env.CAPTURE_BACKEND ?? "auto").toLowerCase();
+      if (raw === "imagesnap" || raw === "ffmpeg" || raw === "auto") return raw;
+      throw new Error(`Invalid CAPTURE_BACKEND: ${raw}`);
+    })(),
+    // nv12 avoids the green-cast uyvy422 path on this UVC unit; imagesnap preferred for color.
+    capturePixelFormat: process.env.CAPTURE_PIXEL_FORMAT ?? "nv12",
+    // 2592x1944 hangs via ffmpeg AVFoundation; imagesnap captures it correctly.
+    // FFmpeg fallback default: 1280x720 — much better AE/color than 2560x1440 uyvy.
+    captureDefaultWidth: intEnv("CAPTURE_DEFAULT_WIDTH", 1280),
+    captureDefaultHeight: intEnv("CAPTURE_DEFAULT_HEIGHT", 720),
     captureFramerate: intEnv("CAPTURE_FRAMERATE", 10),
     captureTimeoutMs: intEnv("CAPTURE_TIMEOUT_MS", 30_000),
     // ~1.8s at 10fps ≈ 18 frames; cold-start AE climbs for ~2–3s on this UVC unit.

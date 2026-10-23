@@ -1,5 +1,7 @@
 import { execFile, spawn } from "node:child_process";
+import { access } from "node:fs/promises";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -7,6 +9,66 @@ import type { AppConfig } from "../config.js";
 import { AppError } from "../errors.js";
 
 const execFileAsync = promisify(execFile);
+
+async function commandExists(cmd: string): Promise<boolean> {
+  if (cmd.includes("/") || cmd.includes("\\")) {
+    try {
+      await access(cmd, fsConstants.X_OK);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  try {
+    await execFileAsync("which", [cmd]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function probeImageSize(
+  imagePath: string,
+): Promise<{ width: number; height: number } | null> {
+  try {
+    const { stdout } = await execFileAsync(
+      "ffprobe",
+      [
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=width,height",
+        "-of",
+        "csv=p=0",
+        imagePath,
+      ],
+      { timeout: 8_000 },
+    );
+    const parts = stdout.trim().split(/[x,\s]+/).filter(Boolean);
+    const w = Number.parseInt(parts[0] ?? "", 10);
+    const h = Number.parseInt(parts[1] ?? "", 10);
+    if (Number.isFinite(w) && Number.isFinite(h) && w > 0 && h > 0) {
+      return { width: w, height: h };
+    }
+  } catch {
+    /* fall through */
+  }
+  try {
+    const { stdout } = await execFileAsync(
+      "sips",
+      ["-g", "pixelWidth", "-g", "pixelHeight", imagePath],
+      { timeout: 8_000 },
+    );
+    const w = Number.parseInt(stdout.match(/pixelWidth:\s*(\d+)/)?.[1] ?? "", 10);
+    const h = Number.parseInt(stdout.match(/pixelHeight:\s*(\d+)/)?.[1] ?? "", 10);
+    if (Number.isFinite(w) && Number.isFinite(h)) return { width: w, height: h };
+  } catch {
+    /* ignore */
+  }
+  return null;
+}
 
 export type VideoDevice = {
   index: number;
@@ -41,6 +103,8 @@ export type CaptureResult = {
   warmupFrames: number;
   /** Mean gray luminance of the kept frame (0–255), when measurable. */
   meanLuminance: number | null;
+  backend: "imagesnap" | "ffmpeg";
+  pixelFormat: string | null;
 };
 
 type UsbCameraInfo = {
@@ -430,6 +494,83 @@ export class FfmpegAvfoundationAdapter {
     warmupMs?: number;
   }): Promise<CaptureResult> {
     const device = await this.getDevice(opts.serial);
+    const warmupMs = Math.max(0, opts.warmupMs ?? this.config.captureWarmupMs);
+    const backend = this.config.captureBackend;
+
+    if (backend === "imagesnap" || backend === "auto") {
+      const snap = await this.captureWithImagesnap(device, opts.format, warmupMs);
+      if (snap) return snap;
+      if (backend === "imagesnap") {
+        throw new AppError(
+          500,
+          "CAPTURE_FAILED",
+          "imagesnap capture failed (is imagesnap installed via brew?)",
+        );
+      }
+    }
+
+    return this.captureWithFfmpeg(device, opts, warmupMs);
+  }
+
+  private async captureWithImagesnap(
+    device: VideoDevice,
+    format: CaptureFormat,
+    warmupMs: number,
+  ): Promise<CaptureResult | null> {
+    if (!(await commandExists(this.config.imagesnapPath))) return null;
+
+    const dir = await mkdtemp(join(tmpdir(), "neor-snap-"));
+    const ext = format === "png" ? "png" : "jpg";
+    const outPath = join(dir, `frame.${ext}`);
+    const warmupSec = Math.max(0, warmupMs / 1000);
+    try {
+      await execFileAsync(
+        this.config.imagesnapPath,
+        ["-q", "-d", device.name, "-w", warmupSec.toFixed(2), outPath],
+        {
+          timeout: Math.max(15_000, warmupMs + 12_000),
+          env: {
+            ...process.env,
+            PATH: `/opt/homebrew/bin:/usr/local/bin:${process.env.PATH ?? ""}`,
+          },
+        },
+      );
+      const buffer = await readFile(outPath);
+      if (buffer.length === 0) return null;
+      const size = (await probeImageSize(outPath)) ?? { width: 2592, height: 1944 };
+      const meanLuminance = await meanLuminanceOfImage(
+        this.config.ffmpegPath,
+        outPath,
+      );
+      return {
+        buffer,
+        contentType: format === "png" ? "image/png" : "image/jpeg",
+        width: size.width,
+        height: size.height,
+        format,
+        device,
+        warmupMs,
+        warmupFrames: Math.max(1, Math.round(warmupSec * 10)),
+        meanLuminance,
+        backend: "imagesnap",
+        pixelFormat: null,
+      };
+    } catch {
+      return null;
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+
+  private async captureWithFfmpeg(
+    device: VideoDevice,
+    opts: {
+      format: CaptureFormat;
+      width?: number;
+      height?: number;
+    },
+    warmupMs: number,
+  ): Promise<CaptureResult> {
     const modes =
       device.supportedModes.length > 0
         ? device.supportedModes
@@ -444,16 +585,11 @@ export class FfmpegAvfoundationAdapter {
       this.config.captureFramerate,
     );
 
-    // If caller asked for specific size not in modes, still try requested size first
     const width = opts.width ?? mode.width;
     const height = opts.height ?? mode.height;
     const fps = mode.fps || this.config.captureFramerate;
-    const warmupMs = Math.max(
-      0,
-      opts.warmupMs ?? this.config.captureWarmupMs,
-    );
-    // Grab N frames and keep the last (-update 1) so AE can converge.
     const warmupFrames = Math.max(1, Math.ceil((warmupMs / 1000) * fps) || 1);
+    const pixelFormat = this.config.capturePixelFormat || "nv12";
 
     const dir = await mkdtemp(join(tmpdir(), "neor-capture-"));
     const ext = opts.format === "png" ? "png" : "jpg";
@@ -473,77 +609,87 @@ export class FfmpegAvfoundationAdapter {
             outPath,
           ];
 
-    // Prefer AVFoundation device name — indices reorder; name is stable for UVC.
     const input = `${device.name}:none`;
+    // Prefer sizes that expose correctly via ffmpeg; 2592x1944 hangs — use imagesnap for that.
+    // 1280x720 nv12 has near-neutral color and good AE on this unit.
     const sizeCandidates = dedupeSizes([
       { width, height, fps },
+      { width: 1280, height: 720, fps: 10 },
+      { width: 1920, height: 1080, fps: 10 },
       { width: mode.width, height: mode.height, fps: mode.fps || this.config.captureFramerate },
-      // Prefer landscape modes that actually capture on this unit; skip flaky 2592x1944.
       ...modes.filter((m) => !(m.width === 2592 && m.height === 1944)),
       { width: 2560, height: 1440, fps: 10 },
-      { width: 1920, height: 1080, fps: 10 },
-      { width: 1280, height: 720, fps: 10 },
       { width: 640, height: 480, fps: 10 },
     ]);
+
+    const pixFmtCandidates = [...new Set([pixelFormat, "nv12", "uyvy422"])];
 
     try {
       let lastErr = "";
       for (const size of sizeCandidates) {
-        const args = [
-          "-hide_banner",
-          "-loglevel",
-          "error",
-          "-y",
-          "-f",
-          "avfoundation",
-          "-pixel_format",
-          "uyvy422",
-          "-framerate",
-          String(size.fps),
-          "-video_size",
-          `${size.width}x${size.height}`,
-          "-i",
-          input,
-          ...frameArgs,
-        ];
-        const timeoutMs = Math.min(
-          this.config.captureTimeoutMs,
-          Math.max(12_000, warmupMs + 10_000),
-        );
-        try {
-          const result = await runFfmpeg(
-            this.config.ffmpegPath,
-            args,
-            timeoutMs,
+        for (const pf of pixFmtCandidates) {
+          const args = [
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "avfoundation",
+            "-pixel_format",
+            pf,
+            "-framerate",
+            String(size.fps),
+            "-video_size",
+            `${size.width}x${size.height}`,
+            "-i",
+            input,
+            // Full-range RGB encode helps avoid crushed/green limited-range JPEG.
+            "-vf",
+            "scale=in_range=auto:out_range=pc,format=rgb24",
+            ...frameArgs,
+          ];
+          const timeoutMs = Math.min(
+            this.config.captureTimeoutMs,
+            Math.max(12_000, warmupMs + 10_000),
           );
-          if (result.code === 0) {
-            const buffer = await readFile(outPath);
-            if (buffer.length === 0) {
-              throw new AppError(500, "CAPTURE_EMPTY", "Captured image is empty");
-            }
-            const meanLuminance = await meanLuminanceOfImage(
+          try {
+            const result = await runFfmpeg(
               this.config.ffmpegPath,
-              outPath,
+              args,
+              timeoutMs,
             );
-            return {
-              buffer,
-              contentType: opts.format === "png" ? "image/png" : "image/jpeg",
-              width: size.width,
-              height: size.height,
-              format: opts.format,
-              device,
-              warmupMs,
-              warmupFrames,
-              meanLuminance,
-            };
+            if (result.code === 0) {
+              const buffer = await readFile(outPath);
+              if (buffer.length === 0) {
+                throw new AppError(500, "CAPTURE_EMPTY", "Captured image is empty");
+              }
+              const probed = await probeImageSize(outPath);
+              const meanLuminance = await meanLuminanceOfImage(
+                this.config.ffmpegPath,
+                outPath,
+              );
+              return {
+                buffer,
+                contentType: opts.format === "png" ? "image/png" : "image/jpeg",
+                width: probed?.width ?? size.width,
+                height: probed?.height ?? size.height,
+                format: opts.format,
+                device,
+                warmupMs,
+                warmupFrames,
+                meanLuminance,
+                backend: "ffmpeg",
+                pixelFormat: pf,
+              };
+            }
+            lastErr = result.stderr || `exit ${result.code}`;
+          } catch (err) {
+            if (err instanceof AppError && err.code === "CAPTURE_TIMEOUT") {
+              lastErr = err.message;
+              continue;
+            }
+            throw err;
           }
-          lastErr = result.stderr || `exit ${result.code}`;
-        } catch (err) {
-          if (err instanceof AppError && err.code === "CAPTURE_TIMEOUT") {
-            lastErr = err.message;
-            continue;
-          }
-          throw err;
         }
       }
 

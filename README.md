@@ -9,7 +9,9 @@ Local Node.js REST service for the **NEOR NW 500** on macOS via **UVC + FFmpeg**
 - macOS with Camera permission for Terminal / Node
 - Node.js 20+
 - [FFmpeg](https://ffmpeg.org/) (`brew install ffmpeg`)
-- Python 3 venv with OpenCV (for `autoCrop` / `deskew` only):
+- [imagesnap](https://github.com/rharder/imagesnap) (`brew install imagesnap`) — preferred still capture (correct color at native 2592×1944)
+- [Tesseract](https://github.com/tesseract-ocr/tesseract) (`brew install tesseract`) — OSD auto-rotate when `rotate=auto`
+- Python 3 venv with OpenCV (for `autoCrop` / `deskew` / enhance):
   ```bash
   python3 -m venv .venv
   .venv/bin/pip install -r requirements.txt
@@ -26,8 +28,11 @@ Local Node.js REST service for the **NEOR NW 500** on macOS via **UVC + FFmpeg**
 | `DEVICE_USB_SERIAL` | `SN0001` | USB `iSerial` if it differs from the label |
 | `DEVICE_NAME_MATCH` | `USB` | Substring match on AVFoundation name |
 | `FFMPEG_PATH` | `ffmpeg` | Path to ffmpeg |
-| `CAPTURE_DEFAULT_WIDTH` | `2560` | Preferred width (practical max that captures reliably) |
-| `CAPTURE_DEFAULT_HEIGHT` | `1440` | Preferred height |
+| `IMAGESNAP_PATH` | `imagesnap` | Still capture (`brew install imagesnap`) — preferred for correct color @ 2592×1944 |
+| `CAPTURE_BACKEND` | `auto` | `auto` \| `imagesnap` \| `ffmpeg` |
+| `CAPTURE_PIXEL_FORMAT` | `nv12` | FFmpeg AVFoundation pix_fmt (`uyvy422` caused green cast) |
+| `CAPTURE_DEFAULT_WIDTH` | `1280` | FFmpeg fallback width (1280×720 has better AE/color than 2560 uyvy) |
+| `CAPTURE_DEFAULT_HEIGHT` | `720` | FFmpeg fallback height |
 | `CAPTURE_FRAMERATE` | `10` | Capture fps |
 | `CAPTURE_TIMEOUT_MS` | `30000` | Kill hung ffmpeg (often Camera TCC) |
 | `CAPTURE_WARMUP_MS` | `1800` | Discard frames so UVC auto-exposure can converge before keeping one |

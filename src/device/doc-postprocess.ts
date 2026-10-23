@@ -9,10 +9,15 @@ import type { CaptureFormat } from "./ffmpeg-adapter.js";
 const here = dirname(fileURLToPath(import.meta.url));
 const defaultScript = join(here, "../../scripts/doc_crop.py");
 
+export type RotateMode = "auto" | "0" | "90" | "180" | "270" | "none";
+
 export type PostprocessOptions = {
   autoCrop: boolean;
   deskew: boolean;
-  autoLevel?: boolean;
+  enhance?: boolean;
+  /** When true, force enhance off (raw geometric crop only). */
+  raw?: boolean;
+  rotate?: RotateMode;
   format: CaptureFormat;
   pythonPath?: string;
   scriptPath?: string;
@@ -26,6 +31,13 @@ export type PostprocessResult = {
   method: string;
   confidence: number;
   reason: string;
+  enhanced: boolean;
+  rotation: number;
+  rotationDetected: number;
+  rotationConfidence: number;
+  rotationMethod: string;
+  sharpness: number;
+  focusNote: string;
   sourceWidth: number;
   sourceHeight: number;
 };
@@ -37,7 +49,10 @@ function runPython(
 ): Promise<{ code: number | null; stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
     const child = spawn(pythonPath, args, {
-      env: process.env,
+      env: {
+        ...process.env,
+        PATH: `/opt/homebrew/bin:/usr/local/bin:${process.env.PATH ?? ""}`,
+      },
     });
     let stdout = "";
     let stderr = "";
@@ -68,11 +83,11 @@ export async function postprocessDocument(
   input: Buffer,
   opts: PostprocessOptions,
 ): Promise<PostprocessResult> {
-  if (!opts.autoCrop && !opts.deskew && !opts.autoLevel) {
+  if (!opts.autoCrop && !opts.deskew && !opts.enhance && !opts.raw) {
     throw new AppError(
       400,
       "INVALID_POSTPROCESS",
-      "autoCrop, deskew, or autoLevel must be true",
+      "autoCrop, deskew, or enhance must be true",
     );
   }
 
@@ -86,20 +101,26 @@ export async function postprocessDocument(
   const inPath = join(dir, `in.${ext}`);
   const outPath = join(dir, `out.${ext}`);
 
+  const enhance =
+    opts.raw === true
+      ? false
+      : opts.enhance !== undefined
+        ? opts.enhance
+        : Boolean(opts.autoCrop || opts.deskew);
+  const rotate: RotateMode =
+    opts.rotate ??
+    (opts.autoCrop || opts.deskew ? "auto" : "none");
+
   try {
     await writeFile(inPath, input);
-    const args = [
-      scriptPath,
-      "--input",
-      inPath,
-      "--output",
-      outPath,
-    ];
+    const args = [scriptPath, "--input", inPath, "--output", outPath];
     if (opts.autoCrop) args.push("--auto-crop");
     if (opts.deskew) args.push("--deskew");
-    if (opts.autoLevel) args.push("--auto-level");
+    if (enhance) args.push("--enhance");
+    else args.push("--no-enhance");
+    args.push("--rotate", rotate);
 
-    const result = await runPython(pythonPath, args, 45_000);
+    const result = await runPython(pythonPath, args, 60_000);
     if (result.code !== 0) {
       throw new AppError(
         500,
@@ -114,6 +135,13 @@ export async function postprocessDocument(
       method?: string;
       confidence?: number;
       reason?: string;
+      enhanced?: boolean;
+      rotation?: number;
+      rotationDetected?: number;
+      rotationConfidence?: number;
+      rotationMethod?: string;
+      sharpness?: number;
+      focusNote?: string;
       width?: number;
       height?: number;
       sourceWidth?: number;
@@ -146,6 +174,13 @@ export async function postprocessDocument(
       method: meta.method ?? "unknown",
       confidence: typeof meta.confidence === "number" ? meta.confidence : 0,
       reason: meta.reason ?? (meta.applied ? "ok" : "unknown"),
+      enhanced: Boolean(meta.enhanced),
+      rotation: meta.rotation ?? 0,
+      rotationDetected: meta.rotationDetected ?? meta.rotation ?? 0,
+      rotationConfidence: meta.rotationConfidence ?? 0,
+      rotationMethod: meta.rotationMethod ?? "none",
+      sharpness: meta.sharpness ?? 0,
+      focusNote: meta.focusNote ?? "unknown",
       sourceWidth: meta.sourceWidth ?? 0,
       sourceHeight: meta.sourceHeight ?? 0,
     };

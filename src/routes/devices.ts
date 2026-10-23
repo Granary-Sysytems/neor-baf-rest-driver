@@ -1,6 +1,9 @@
 import type { FastifyPluginAsync } from "fastify";
 import type { FfmpegAvfoundationAdapter, CaptureFormat } from "../device/ffmpeg-adapter.js";
-import { postprocessDocument } from "../device/doc-postprocess.js";
+import {
+  postprocessDocument,
+  type RotateMode,
+} from "../device/doc-postprocess.js";
 import { AppError } from "../errors.js";
 
 type DeviceRoutesOpts = {
@@ -40,6 +43,19 @@ function parseBool(raw: unknown, defaultValue = false): boolean {
   throw new AppError(400, "INVALID_BOOLEAN", `expected boolean, got '${String(raw)}'`);
 }
 
+function parseRotate(raw: unknown, defaultValue: RotateMode): RotateMode {
+  if (raw === undefined || raw === null || raw === "") return defaultValue;
+  const s = String(raw).toLowerCase();
+  if (s === "auto" || s === "none" || s === "0" || s === "90" || s === "180" || s === "270") {
+    return s;
+  }
+  throw new AppError(
+    400,
+    "INVALID_ROTATE",
+    "rotate must be auto|0|90|180|270|none",
+  );
+}
+
 export const deviceRoutes: FastifyPluginAsync<DeviceRoutesOpts> = async (
   app,
   opts,
@@ -66,7 +82,10 @@ export const deviceRoutes: FastifyPluginAsync<DeviceRoutesOpts> = async (
       height?: string;
       autoCrop?: string;
       deskew?: string;
+      enhance?: string;
       autoLevel?: string;
+      raw?: string;
+      rotate?: string;
       warmupMs?: string;
     };
     Body:
@@ -76,7 +95,11 @@ export const deviceRoutes: FastifyPluginAsync<DeviceRoutesOpts> = async (
           height?: number;
           autoCrop?: boolean;
           deskew?: boolean;
+          enhance?: boolean;
+          /** Alias of enhance (legacy). */
           autoLevel?: boolean;
+          raw?: boolean;
+          rotate?: string;
           warmupMs?: number;
           /** Not settable on macOS AVFoundation — accepted and ignored. */
           brightness?: number;
@@ -96,7 +119,16 @@ export const deviceRoutes: FastifyPluginAsync<DeviceRoutesOpts> = async (
     );
     const autoCrop = parseBool(body.autoCrop ?? req.query.autoCrop, false);
     const deskew = parseBool(body.deskew ?? req.query.deskew, false);
-    const autoLevel = parseBool(body.autoLevel ?? req.query.autoLevel, false);
+    const raw = parseBool(body.raw ?? req.query.raw, false);
+    const enhanceExplicit = body.enhance ?? req.query.enhance ?? body.autoLevel ?? req.query.autoLevel;
+    const enhance =
+      enhanceExplicit === undefined || enhanceExplicit === null || enhanceExplicit === ""
+        ? undefined
+        : parseBool(enhanceExplicit, true);
+    const rotate = parseRotate(
+      body.rotate ?? req.query.rotate,
+      autoCrop || deskew ? "auto" : "none",
+    );
     const warmupMsRaw = body.warmupMs ?? req.query.warmupMs;
     let warmupMs: number | undefined;
     if (warmupMsRaw !== undefined && warmupMsRaw !== null && warmupMsRaw !== "") {
@@ -129,16 +161,31 @@ export const deviceRoutes: FastifyPluginAsync<DeviceRoutesOpts> = async (
           method: string;
           confidence: number;
           reason: string;
+          enhanced: boolean;
+          rotation: number;
+          rotationDetected: number;
+          rotationConfidence: number;
+          rotationMethod: string;
+          sharpness: number;
+          focusNote: string;
           sourceWidth: number;
           sourceHeight: number;
         }
       | undefined;
 
-    if (autoCrop || deskew || autoLevel) {
+    const wantsProcess =
+      autoCrop ||
+      deskew ||
+      enhance === true ||
+      (enhance !== false && !raw && (autoCrop || deskew));
+
+    if (wantsProcess || (raw && (autoCrop || deskew))) {
       const processed = await postprocessDocument(captured.buffer, {
         autoCrop,
         deskew,
-        autoLevel,
+        enhance,
+        raw,
+        rotate,
         format,
       });
       captured = {
@@ -152,6 +199,13 @@ export const deviceRoutes: FastifyPluginAsync<DeviceRoutesOpts> = async (
         method: processed.method,
         confidence: processed.confidence,
         reason: processed.reason,
+        enhanced: processed.enhanced,
+        rotation: processed.rotation,
+        rotationDetected: processed.rotationDetected,
+        rotationConfidence: processed.rotationConfidence,
+        rotationMethod: processed.rotationMethod,
+        sharpness: processed.sharpness,
+        focusNote: processed.focusNote,
         sourceWidth: processed.sourceWidth,
         sourceHeight: processed.sourceHeight,
       };
@@ -167,6 +221,8 @@ export const deviceRoutes: FastifyPluginAsync<DeviceRoutesOpts> = async (
         encoding: "base64",
         data: captured.buffer.toString("base64"),
         capture: {
+          backend: captured.backend,
+          pixelFormat: captured.pixelFormat,
           warmupMs: captured.warmupMs,
           warmupFrames: captured.warmupFrames,
           meanLuminance: captured.meanLuminance,
@@ -180,6 +236,8 @@ export const deviceRoutes: FastifyPluginAsync<DeviceRoutesOpts> = async (
       .header("X-Device-Serial", captured.device.serial)
       .header("X-Image-Width", String(captured.width))
       .header("X-Image-Height", String(captured.height))
+      .header("X-Capture-Backend", captured.backend)
+      .header("X-Capture-Pixel-Format", captured.pixelFormat ?? "")
       .header("X-Capture-Warmup-Ms", String(captured.warmupMs))
       .header("X-Capture-Warmup-Frames", String(captured.warmupFrames))
       .header(
@@ -193,6 +251,13 @@ export const deviceRoutes: FastifyPluginAsync<DeviceRoutesOpts> = async (
         post ? String(post.confidence) : "",
       )
       .header("X-Postprocess-Reason", post?.reason ?? "")
+      .header("X-Postprocess-Enhanced", post ? String(post.enhanced) : "false")
+      .header("X-Postprocess-Rotation", post ? String(post.rotation) : "0")
+      .header(
+        "X-Postprocess-Sharpness",
+        post ? String(post.sharpness) : "",
+      )
+      .header("X-Postprocess-Focus", post?.focusNote ?? "")
       .send(captured.buffer);
   });
 
