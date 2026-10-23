@@ -37,6 +37,10 @@ export type CaptureResult = {
   height: number;
   format: CaptureFormat;
   device: VideoDevice;
+  warmupMs: number;
+  warmupFrames: number;
+  /** Mean gray luminance of the kept frame (0–255), when measurable. */
+  meanLuminance: number | null;
 };
 
 type UsbCameraInfo = {
@@ -131,16 +135,53 @@ async function listSystemCameras(): Promise<SystemCameraInfo[]> {
   }
 }
 
+/** Approximate mean gray luminance via ffmpeg raw gray downsample. */
+async function meanLuminanceOfImage(
+  ffmpegPath: string,
+  imagePath: string,
+): Promise<number | null> {
+  try {
+    const result = await runFfmpeg(
+      ffmpegPath,
+      [
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        imagePath,
+        "-vf",
+        "scale=160:-1,format=gray",
+        "-f",
+        "rawvideo",
+        "-",
+      ],
+      8_000,
+    );
+    if (result.code !== 0 || !result.stdoutBinary?.length) return null;
+    const buf = result.stdoutBinary;
+    let sum = 0;
+    for (let i = 0; i < buf.length; i++) sum += buf[i]!;
+    return Math.round((sum / buf.length) * 100) / 100;
+  } catch {
+    return null;
+  }
+}
+
 async function runFfmpeg(
   ffmpegPath: string,
   args: string[],
   timeoutMs: number,
-): Promise<{ stdout: string; stderr: string; code: number | null }> {
+): Promise<{
+  stdout: string;
+  stderr: string;
+  code: number | null;
+  stdoutBinary?: Buffer;
+}> {
   return new Promise((resolve, reject) => {
     const child = spawn(ffmpegPath, args, {
       env: { ...process.env, PATH: `/opt/homebrew/bin:/usr/local/bin:${process.env.PATH ?? ""}` },
     });
-    let stdout = "";
+    const stdoutChunks: Buffer[] = [];
     let stderr = "";
     const timer = setTimeout(() => {
       child.kill("SIGKILL");
@@ -154,7 +195,7 @@ async function runFfmpeg(
     }, timeoutMs);
 
     child.stdout.on("data", (d: Buffer) => {
-      stdout += d.toString("utf8");
+      stdoutChunks.push(d);
     });
     child.stderr.on("data", (d: Buffer) => {
       stderr += d.toString("utf8");
@@ -165,7 +206,13 @@ async function runFfmpeg(
     });
     child.on("close", (code) => {
       clearTimeout(timer);
-      resolve({ stdout, stderr, code });
+      const stdoutBinary = Buffer.concat(stdoutChunks);
+      resolve({
+        stdout: stdoutBinary.toString("utf8"),
+        stderr,
+        code,
+        stdoutBinary,
+      });
     });
   });
 }
@@ -379,6 +426,8 @@ export class FfmpegAvfoundationAdapter {
     format: CaptureFormat;
     width?: number;
     height?: number;
+    /** Override default CAPTURE_WARMUP_MS (UVC AE settle). */
+    warmupMs?: number;
   }): Promise<CaptureResult> {
     const device = await this.getDevice(opts.serial);
     const modes =
@@ -399,14 +448,30 @@ export class FfmpegAvfoundationAdapter {
     const width = opts.width ?? mode.width;
     const height = opts.height ?? mode.height;
     const fps = mode.fps || this.config.captureFramerate;
+    const warmupMs = Math.max(
+      0,
+      opts.warmupMs ?? this.config.captureWarmupMs,
+    );
+    // Grab N frames and keep the last (-update 1) so AE can converge.
+    const warmupFrames = Math.max(1, Math.ceil((warmupMs / 1000) * fps) || 1);
 
     const dir = await mkdtemp(join(tmpdir(), "neor-capture-"));
     const ext = opts.format === "png" ? "png" : "jpg";
     const outPath = join(dir, `frame.${ext}`);
-    const vcodecArgs =
+    const frameArgs =
       opts.format === "png"
-        ? ["-frames:v", "1", "-update", "1", "-f", "image2", outPath]
-        : ["-frames:v", "1", "-update", "1", "-q:v", "2", "-f", "image2", outPath];
+        ? ["-frames:v", String(warmupFrames), "-update", "1", "-f", "image2", outPath]
+        : [
+            "-frames:v",
+            String(warmupFrames),
+            "-update",
+            "1",
+            "-q:v",
+            "2",
+            "-f",
+            "image2",
+            outPath,
+          ];
 
     // Prefer AVFoundation device name — indices reorder; name is stable for UVC.
     const input = `${device.name}:none`;
@@ -439,19 +504,27 @@ export class FfmpegAvfoundationAdapter {
           `${size.width}x${size.height}`,
           "-i",
           input,
-          ...vcodecArgs,
+          ...frameArgs,
         ];
+        const timeoutMs = Math.min(
+          this.config.captureTimeoutMs,
+          Math.max(12_000, warmupMs + 10_000),
+        );
         try {
           const result = await runFfmpeg(
             this.config.ffmpegPath,
             args,
-            Math.min(this.config.captureTimeoutMs, 12_000),
+            timeoutMs,
           );
           if (result.code === 0) {
             const buffer = await readFile(outPath);
             if (buffer.length === 0) {
               throw new AppError(500, "CAPTURE_EMPTY", "Captured image is empty");
             }
+            const meanLuminance = await meanLuminanceOfImage(
+              this.config.ffmpegPath,
+              outPath,
+            );
             return {
               buffer,
               contentType: opts.format === "png" ? "image/png" : "image/jpeg",
@@ -459,6 +532,9 @@ export class FfmpegAvfoundationAdapter {
               height: size.height,
               format: opts.format,
               device,
+              warmupMs,
+              warmupFrames,
+              meanLuminance,
             };
           }
           lastErr = result.stderr || `exit ${result.code}`;

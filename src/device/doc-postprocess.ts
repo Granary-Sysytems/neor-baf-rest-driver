@@ -12,6 +12,7 @@ const defaultScript = join(here, "../../scripts/doc_crop.py");
 export type PostprocessOptions = {
   autoCrop: boolean;
   deskew: boolean;
+  autoLevel?: boolean;
   format: CaptureFormat;
   pythonPath?: string;
   scriptPath?: string;
@@ -23,6 +24,8 @@ export type PostprocessResult = {
   height: number;
   applied: boolean;
   method: string;
+  confidence: number;
+  reason: string;
   sourceWidth: number;
   sourceHeight: number;
 };
@@ -65,8 +68,12 @@ export async function postprocessDocument(
   input: Buffer,
   opts: PostprocessOptions,
 ): Promise<PostprocessResult> {
-  if (!opts.autoCrop && !opts.deskew) {
-    throw new AppError(400, "INVALID_POSTPROCESS", "autoCrop or deskew must be true");
+  if (!opts.autoCrop && !opts.deskew && !opts.autoLevel) {
+    throw new AppError(
+      400,
+      "INVALID_POSTPROCESS",
+      "autoCrop, deskew, or autoLevel must be true",
+    );
   }
 
   const pythonPath =
@@ -90,6 +97,7 @@ export async function postprocessDocument(
     ];
     if (opts.autoCrop) args.push("--auto-crop");
     if (opts.deskew) args.push("--deskew");
+    if (opts.autoLevel) args.push("--auto-level");
 
     const result = await runPython(pythonPath, args, 45_000);
     if (result.code !== 0) {
@@ -104,6 +112,8 @@ export async function postprocessDocument(
       ok?: boolean;
       applied?: boolean;
       method?: string;
+      confidence?: number;
+      reason?: string;
       width?: number;
       height?: number;
       sourceWidth?: number;
@@ -134,6 +144,8 @@ export async function postprocessDocument(
       height: meta.height ?? 0,
       applied: Boolean(meta.applied),
       method: meta.method ?? "unknown",
+      confidence: typeof meta.confidence === "number" ? meta.confidence : 0,
+      reason: meta.reason ?? (meta.applied ? "ok" : "unknown"),
       sourceWidth: meta.sourceWidth ?? 0,
       sourceHeight: meta.sourceHeight ?? 0,
     };

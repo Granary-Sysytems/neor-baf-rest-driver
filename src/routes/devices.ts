@@ -66,6 +66,8 @@ export const deviceRoutes: FastifyPluginAsync<DeviceRoutesOpts> = async (
       height?: string;
       autoCrop?: string;
       deskew?: string;
+      autoLevel?: string;
+      warmupMs?: string;
     };
     Body:
       | {
@@ -74,6 +76,11 @@ export const deviceRoutes: FastifyPluginAsync<DeviceRoutesOpts> = async (
           height?: number;
           autoCrop?: boolean;
           deskew?: boolean;
+          autoLevel?: boolean;
+          warmupMs?: number;
+          /** Not settable on macOS AVFoundation — accepted and ignored. */
+          brightness?: number;
+          exposure?: number;
         }
       | undefined;
   }>("/api/v1/devices/:serial/capture", async (req, reply) => {
@@ -89,27 +96,49 @@ export const deviceRoutes: FastifyPluginAsync<DeviceRoutesOpts> = async (
     );
     const autoCrop = parseBool(body.autoCrop ?? req.query.autoCrop, false);
     const deskew = parseBool(body.deskew ?? req.query.deskew, false);
+    const autoLevel = parseBool(body.autoLevel ?? req.query.autoLevel, false);
+    const warmupMsRaw = body.warmupMs ?? req.query.warmupMs;
+    let warmupMs: number | undefined;
+    if (warmupMsRaw !== undefined && warmupMsRaw !== null && warmupMsRaw !== "") {
+      const n =
+        typeof warmupMsRaw === "number"
+          ? warmupMsRaw
+          : Number.parseInt(String(warmupMsRaw), 10);
+      if (!Number.isFinite(n) || n < 0) {
+        throw new AppError(400, "INVALID_WARMUP", "warmupMs must be >= 0");
+      }
+      warmupMs = Math.trunc(n);
+    }
+
+    // brightness/exposure: probed — not available via ffmpeg avfoundation / no uvc-util on brew.
+    if (body.brightness !== undefined || body.exposure !== undefined) {
+      reply.header("X-Uvc-Controls", "unsupported");
+    }
 
     let captured = await adapter.capture({
       serial: req.params.serial,
       format,
       width,
       height,
+      warmupMs,
     });
 
     let post:
       | {
           applied: boolean;
           method: string;
+          confidence: number;
+          reason: string;
           sourceWidth: number;
           sourceHeight: number;
         }
       | undefined;
 
-    if (autoCrop || deskew) {
+    if (autoCrop || deskew || autoLevel) {
       const processed = await postprocessDocument(captured.buffer, {
         autoCrop,
         deskew,
+        autoLevel,
         format,
       });
       captured = {
@@ -121,6 +150,8 @@ export const deviceRoutes: FastifyPluginAsync<DeviceRoutesOpts> = async (
       post = {
         applied: processed.applied,
         method: processed.method,
+        confidence: processed.confidence,
+        reason: processed.reason,
         sourceWidth: processed.sourceWidth,
         sourceHeight: processed.sourceHeight,
       };
@@ -135,6 +166,11 @@ export const deviceRoutes: FastifyPluginAsync<DeviceRoutesOpts> = async (
         serial: captured.device.serial,
         encoding: "base64",
         data: captured.buffer.toString("base64"),
+        capture: {
+          warmupMs: captured.warmupMs,
+          warmupFrames: captured.warmupFrames,
+          meanLuminance: captured.meanLuminance,
+        },
         postprocess: post,
       };
     }
@@ -144,8 +180,19 @@ export const deviceRoutes: FastifyPluginAsync<DeviceRoutesOpts> = async (
       .header("X-Device-Serial", captured.device.serial)
       .header("X-Image-Width", String(captured.width))
       .header("X-Image-Height", String(captured.height))
+      .header("X-Capture-Warmup-Ms", String(captured.warmupMs))
+      .header("X-Capture-Warmup-Frames", String(captured.warmupFrames))
+      .header(
+        "X-Capture-Mean-Luminance",
+        captured.meanLuminance != null ? String(captured.meanLuminance) : "",
+      )
       .header("X-Postprocess-Applied", post ? String(post.applied) : "false")
       .header("X-Postprocess-Method", post?.method ?? "none")
+      .header(
+        "X-Postprocess-Confidence",
+        post ? String(post.confidence) : "",
+      )
+      .header("X-Postprocess-Reason", post?.reason ?? "")
       .send(captured.buffer);
   });
 

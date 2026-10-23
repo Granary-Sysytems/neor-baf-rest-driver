@@ -249,6 +249,28 @@ export function buildOpenApi(opts: { title: string; version: string }) {
               description:
                 "Perspective straighten; same pipeline as autoCrop when either is true",
             },
+            autoLevel: {
+              type: "boolean",
+              default: false,
+              description:
+                "Optional CLAHE luminance stretch on the output image (default off)",
+            },
+            warmupMs: {
+              type: "integer",
+              minimum: 0,
+              description:
+                "Discard frames this long before keeping one (UVC auto-exposure settle). Default CAPTURE_WARMUP_MS=1800",
+            },
+            brightness: {
+              type: "number",
+              description:
+                "Ignored on macOS — UVC brightness/exposure not settable via AVFoundation (no uvc-util)",
+            },
+            exposure: {
+              type: "number",
+              description:
+                "Ignored on macOS — UVC brightness/exposure not settable via AVFoundation (no uvc-util)",
+            },
           },
         },
         CaptureJson: {
@@ -261,12 +283,22 @@ export function buildOpenApi(opts: { title: string; version: string }) {
             serial: { type: "string" },
             encoding: { type: "string", example: "base64" },
             data: { type: "string", description: "Base64-encoded image bytes" },
+            capture: {
+              type: "object",
+              properties: {
+                warmupMs: { type: "integer" },
+                warmupFrames: { type: "integer" },
+                meanLuminance: { type: "number", nullable: true },
+              },
+            },
             postprocess: {
               type: "object",
               nullable: true,
               properties: {
                 applied: { type: "boolean" },
                 method: { type: "string" },
+                confidence: { type: "number" },
+                reason: { type: "string" },
                 sourceWidth: { type: "integer" },
                 sourceHeight: { type: "integer" },
               },

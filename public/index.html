@@ -183,6 +183,8 @@
         </label>
         <label><input type="checkbox" id="autoCrop" /> autoCrop</label>
         <label><input type="checkbox" id="deskew" /> deskew</label>
+        <label><input type="checkbox" id="autoLevel" /> autoLevel</label>
+        <label>warmupMs <input id="warmupMs" type="text" value="1800" style="min-width:5rem" /></label>
       </div>
       <div class="row">
         <button type="button" id="btnCapture">Зробити знімок</button>
@@ -230,15 +232,20 @@
       const format = $("format").value;
       const autoCrop = $("autoCrop").checked;
       const deskew = $("deskew").checked;
+      const autoLevel = $("autoLevel").checked;
+      const warmupRaw = $("warmupMs").value.trim();
+      const warmupMs = warmupRaw === "" ? undefined : Number.parseInt(warmupRaw, 10);
       const msg = $("captureMsg");
       msg.className = "msg";
       msg.textContent = "Зйомка…";
       const preview = $("preview");
       try {
+        const body = { format, autoCrop, deskew, autoLevel };
+        if (Number.isFinite(warmupMs) && warmupMs >= 0) body.warmupMs = warmupMs;
         const r = await fetch("/api/v1/devices/" + encodeURIComponent(serial) + "/capture", {
           method: "POST",
           headers: { "Content-Type": "application/json", Accept: "image/*" },
-          body: JSON.stringify({ format, autoCrop, deskew }),
+          body: JSON.stringify(body),
         });
         if (!r.ok) {
           const err = await r.json().catch(() => ({}));
@@ -259,10 +266,26 @@
         const w = r.headers.get("X-Image-Width");
         const h = r.headers.get("X-Image-Height");
         const applied = r.headers.get("X-Postprocess-Applied");
-        msg.className = "msg ok";
-        msg.textContent =
-          "OK · " + blob.type + (w && h ? " · " + w + "×" + h : "") +
-          (applied != null ? " · postprocess=" + applied : "");
+        const method = r.headers.get("X-Postprocess-Method");
+        const conf = r.headers.get("X-Postprocess-Confidence");
+        const reason = r.headers.get("X-Postprocess-Reason");
+        const lum = r.headers.get("X-Capture-Mean-Luminance");
+        const warm = r.headers.get("X-Capture-Warmup-Ms");
+        const parts = [
+          "OK",
+          blob.type,
+          w && h ? w + "×" + h : null,
+          lum ? "luma=" + lum : null,
+          warm != null && warm !== "" ? "warmup=" + warm + "ms" : null,
+        ];
+        if (applied === "true") {
+          parts.push("crop=yes", method, conf ? "conf=" + conf : null);
+        } else if (autoCrop || deskew) {
+          parts.push("crop=no", reason || method || "fallback");
+          if (conf) parts.push("conf=" + conf);
+        }
+        msg.className = applied === "false" && (autoCrop || deskew) ? "msg err" : "msg ok";
+        msg.textContent = parts.filter(Boolean).join(" · ");
       } catch (e) {
         msg.className = "msg err";
         msg.textContent = String(e);

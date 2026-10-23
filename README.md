@@ -30,6 +30,7 @@ Local Node.js REST service for the **NEOR NW 500** on macOS via **UVC + FFmpeg**
 | `CAPTURE_DEFAULT_HEIGHT` | `1440` | Preferred height |
 | `CAPTURE_FRAMERATE` | `10` | Capture fps |
 | `CAPTURE_TIMEOUT_MS` | `30000` | Kill hung ffmpeg (often Camera TCC) |
+| `CAPTURE_WARMUP_MS` | `1800` | Discard frames so UVC auto-exposure can converge before keeping one |
 | `DOC_CROP_PYTHON` | `.venv/bin/python` | Python with OpenCV for post-process |
 | `DOC_CROP_SCRIPT` | `scripts/doc_crop.py` | Crop/deskew script |
 
@@ -58,7 +59,7 @@ System Settings → Privacy & Security → Camera → allow **Terminal** (or the
 | `GET` | `/health` | Liveness |
 | `GET` | `/api/v1/devices` | List UVC / AVFoundation cameras |
 | `GET` | `/api/v1/devices/{serial}` | One device |
-| `POST` | `/api/v1/devices/{serial}/capture` | Still frame; optional `autoCrop` / `deskew` (default **false**) |
+| `POST` | `/api/v1/devices/{serial}/capture` | Still frame; optional `warmupMs`, `autoCrop` / `deskew` / `autoLevel` (crop defaults **false**; low-confidence crop falls back to original) |
 | `POST` | `/api/v1/devices/{serial}/light` | LED/lamp — on macOS returns **501** `LIGHT_UNSUPPORTED` |
 | `GET` | `/openapi.json` | OpenAPI 3 |
 
@@ -76,17 +77,18 @@ Open the test page: [http://127.0.0.1:8787/](http://127.0.0.1:8787/)
 curl -s http://127.0.0.1:8787/health | jq
 curl -s http://127.0.0.1:8787/api/v1/devices | jq
 
-# plain capture (unchanged default)
+# plain capture (default ~1.8s AE warmup)
 curl -s -X POST http://127.0.0.1:8787/api/v1/devices/DK50P30000422/capture \
   -H 'Content-Type: application/json' \
   -d '{"format":"jpeg"}' \
   -o capture.jpg
 
-# auto-crop + perspective deskew (OpenCV)
+# first-frame vs warmed (set warmupMs:0 vs 1800) — room LED/lamp helps; AE still needs settle
+# auto-crop + perspective deskew (OpenCV; may return applied=false + reason)
 curl -s -X POST http://127.0.0.1:8787/api/v1/devices/DK50P30000422/capture \
   -H 'Accept: application/json' \
   -H 'Content-Type: application/json' \
-  -d '{"format":"jpeg","autoCrop":true,"deskew":true}' | jq '.width,.height,.postprocess'
+  -d '{"format":"jpeg","autoCrop":true,"deskew":true}' | jq '.width,.height,.capture,.postprocess'
 
 # light (macOS → 501)
 curl -s -X POST http://127.0.0.1:8787/api/v1/devices/DK50P30000422/light \

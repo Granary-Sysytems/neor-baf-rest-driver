@@ -9,6 +9,8 @@ export type AppConfig = {
   captureDefaultHeight: number;
   captureFramerate: number;
   captureTimeoutMs: number;
+  /** Discard frames for this long so UVC auto-exposure can converge. */
+  captureWarmupMs: number;
 };
 
 function intEnv(name: string, fallback: number): number {
@@ -34,5 +36,7 @@ export function loadConfig(): AppConfig {
     captureDefaultHeight: intEnv("CAPTURE_DEFAULT_HEIGHT", 1440),
     captureFramerate: intEnv("CAPTURE_FRAMERATE", 10),
     captureTimeoutMs: intEnv("CAPTURE_TIMEOUT_MS", 30_000),
+    // ~1.8s at 10fps ≈ 18 frames; cold-start AE climbs for ~2–3s on this UVC unit.
+    captureWarmupMs: intEnv("CAPTURE_WARMUP_MS", 1800),
   };
 }
