@@ -1,0 +1,43 @@
+NEOR NW 500 UVC verification — 2026-10-23 (local Mac)
+
+Target label serial: DK50P30000422
+
+## system_profiler SPUSBDataType
+Empty array on this Mac (SPUSBDataType : []). Device still visible via ioreg + SPCameraDataType.
+
+## ioreg (IOUSB) — USB Camera
+- Product: USB Camera
+- USB Serial Number / kUSBSerialNumberString: SN0001
+- idVendor: 48149 (0xBC15)
+- idProduct: 11291 (0x2C1B)
+- bDeviceClass: 239 (Miscellaneous / UVC composite)
+- UsbLinkSpeed: 480000000 (High Speed)
+
+## system_profiler SPCameraDataType
+1) Камера FaceTime HD — Unique ID 47B4B64B-7067-4B9C-AD2B-AE273A71F4B5
+2) USB-камера — Model ID: UVC Camera VendorID_48149 ProductID_11291 — Unique ID: 0x2100000bc152c1b
+
+## ffmpeg -f avfoundation -list_devices true -i ""
+AVFoundation video devices:
+  [0] Камера FaceTime HD
+  [1] USB-камера
+  [2] Capture screen 0
+AVFoundation audio devices:
+  [0] Microsoft Teams Audio
+  [1] USB Camera
+  [2] Мікрофон MacBook Pro
+
+## Supported video modes (probe via unsupported 3264x2448 request)
+  640x480@10fps
+  1280x720@10fps / 5fps
+  1920x1080@10fps / 2fps
+  2560x1440@10fps / 2fps
+  2592x1944@10fps / 2fps
+
+NOTE: 3264x2448 is NOT supported by this device via AVFoundation.
+2592x1944 is advertised but hangs during capture; practical max: 2560x1440@10fps.
+Default capture preference: 2560x1440@10fps.
+
+## Hardware gate
+PASS — device present on USB and visible as UVC in AVFoundation ([1] USB-камера).
+USB iSerial SN0001 differs from label DK50P30000422; driver maps target serial via DEVICE_SERIAL + DEVICE_USB_SERIAL / name / vendorId.
