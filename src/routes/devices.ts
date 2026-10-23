@@ -1,5 +1,6 @@
 import type { FastifyPluginAsync } from "fastify";
 import type { FfmpegAvfoundationAdapter, CaptureFormat } from "../device/ffmpeg-adapter.js";
+import { postprocessDocument } from "../device/doc-postprocess.js";
 import { AppError } from "../errors.js";
 
 type DeviceRoutesOpts = {
@@ -30,6 +31,15 @@ function parseOptionalPositiveInt(raw: unknown, field: string): number | undefin
   return Math.trunc(n);
 }
 
+function parseBool(raw: unknown, defaultValue = false): boolean {
+  if (raw === undefined || raw === null || raw === "") return defaultValue;
+  if (typeof raw === "boolean") return raw;
+  const s = String(raw).toLowerCase();
+  if (["1", "true", "yes", "on"].includes(s)) return true;
+  if (["0", "false", "no", "off"].includes(s)) return false;
+  throw new AppError(400, "INVALID_BOOLEAN", `expected boolean, got '${String(raw)}'`);
+}
+
 export const deviceRoutes: FastifyPluginAsync<DeviceRoutesOpts> = async (
   app,
   opts,
@@ -50,8 +60,22 @@ export const deviceRoutes: FastifyPluginAsync<DeviceRoutesOpts> = async (
 
   app.post<{
     Params: { serial: string };
-    Querystring: { format?: string; width?: string; height?: string };
-    Body: { format?: string; width?: number; height?: number } | undefined;
+    Querystring: {
+      format?: string;
+      width?: string;
+      height?: string;
+      autoCrop?: string;
+      deskew?: string;
+    };
+    Body:
+      | {
+          format?: string;
+          width?: number;
+          height?: number;
+          autoCrop?: boolean;
+          deskew?: boolean;
+        }
+      | undefined;
   }>("/api/v1/devices/:serial/capture", async (req, reply) => {
     const body = req.body ?? {};
     const format = parseFormat(body.format ?? req.query.format);
@@ -63,13 +87,44 @@ export const deviceRoutes: FastifyPluginAsync<DeviceRoutesOpts> = async (
       body.height ?? req.query.height,
       "height",
     );
+    const autoCrop = parseBool(body.autoCrop ?? req.query.autoCrop, false);
+    const deskew = parseBool(body.deskew ?? req.query.deskew, false);
 
-    const captured = await adapter.capture({
+    let captured = await adapter.capture({
       serial: req.params.serial,
       format,
       width,
       height,
     });
+
+    let post:
+      | {
+          applied: boolean;
+          method: string;
+          sourceWidth: number;
+          sourceHeight: number;
+        }
+      | undefined;
+
+    if (autoCrop || deskew) {
+      const processed = await postprocessDocument(captured.buffer, {
+        autoCrop,
+        deskew,
+        format,
+      });
+      captured = {
+        ...captured,
+        buffer: processed.buffer,
+        width: processed.width,
+        height: processed.height,
+      };
+      post = {
+        applied: processed.applied,
+        method: processed.method,
+        sourceWidth: processed.sourceWidth,
+        sourceHeight: processed.sourceHeight,
+      };
+    }
 
     if (wantsJson(req.headers.accept)) {
       return {
@@ -80,6 +135,7 @@ export const deviceRoutes: FastifyPluginAsync<DeviceRoutesOpts> = async (
         serial: captured.device.serial,
         encoding: "base64",
         data: captured.buffer.toString("base64"),
+        postprocess: post,
       };
     }
 
@@ -88,6 +144,49 @@ export const deviceRoutes: FastifyPluginAsync<DeviceRoutesOpts> = async (
       .header("X-Device-Serial", captured.device.serial)
       .header("X-Image-Width", String(captured.width))
       .header("X-Image-Height", String(captured.height))
+      .header("X-Postprocess-Applied", post ? String(post.applied) : "false")
+      .header("X-Postprocess-Method", post?.method ?? "none")
       .send(captured.buffer);
+  });
+
+  /**
+   * Camera LED / lamp control.
+   * On macOS UVC path this is unsupported (vendor Set_Light_A/B is Windows OCX only).
+   */
+  app.post<{
+    Params: { serial: string };
+    Body: { on?: boolean; mode?: string } | undefined;
+  }>("/api/v1/devices/:serial/light", async (req) => {
+    // Ensure device exists / is resolvable
+    await adapter.getDevice(req.params.serial);
+
+    const body = req.body ?? {};
+    const modeRaw = body.mode;
+    const on = body.on;
+
+    if (modeRaw !== undefined && modeRaw !== null && modeRaw !== "") {
+      const mode = String(modeRaw).toUpperCase();
+      if (!["A", "B", "OFF", "ON"].includes(mode)) {
+        throw new AppError(
+          400,
+          "INVALID_LIGHT_MODE",
+          "mode must be A, B, ON, or OFF (vendor OCX naming)",
+        );
+      }
+    } else if (on === undefined) {
+      throw new AppError(
+        400,
+        "INVALID_LIGHT_REQUEST",
+        'provide { "on": true|false } or { "mode": "A"|"B"|"off" }',
+      );
+    }
+
+    throw new AppError(
+      501,
+      "LIGHT_UNSUPPORTED",
+      "Camera LED/lamp control is not available on the macOS UVC path. " +
+        "Vendor APIs Set_Light_A / Set_Light_B exist only in Windows OCX (Cam_OcxTwo). " +
+        "See internal design note for a Windows sidecar option.",
+    );
   });
 };

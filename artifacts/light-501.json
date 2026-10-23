@@ -1,0 +1,1 @@
+{"error":{"code":"LIGHT_UNSUPPORTED","message":"Camera LED/lamp control is not available on the macOS UVC path. Vendor APIs Set_Light_A / Set_Light_B exist only in Windows OCX (Cam_OcxTwo). See internal design note for a Windows sidecar option."}}

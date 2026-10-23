@@ -132,6 +132,50 @@ export function buildOpenApi(opts: { title: string; version: string }) {
           },
         },
       },
+      "/api/v1/devices/{serial}/light": {
+        post: {
+          summary: "Camera LED / lamp control",
+          description:
+            "On macOS UVC this returns 501 LIGHT_UNSUPPORTED. Vendor Set_Light_A/B is Windows OCX only.",
+          operationId: "setDeviceLight",
+          parameters: [
+            {
+              name: "serial",
+              in: "path",
+              required: true,
+              schema: { type: "string", example: "DK50P30000422" },
+            },
+          ],
+          requestBody: {
+            required: true,
+            content: {
+              "application/json": {
+                schema: { $ref: "#/components/schemas/LightRequest" },
+              },
+            },
+          },
+          responses: {
+            "200": {
+              description: "Light toggled (Windows sidecar only — not on macOS UVC)",
+              content: {
+                "application/json": {
+                  schema: {
+                    type: "object",
+                    properties: {
+                      serial: { type: "string" },
+                      on: { type: "boolean" },
+                      mode: { type: "string" },
+                    },
+                  },
+                },
+              },
+            },
+            "400": { $ref: "#/components/responses/Error" },
+            "404": { $ref: "#/components/responses/Error" },
+            "501": { $ref: "#/components/responses/Error" },
+          },
+        },
+      },
       "/openapi.json": {
         get: {
           summary: "OpenAPI document",
@@ -179,6 +223,18 @@ export function buildOpenApi(opts: { title: string; version: string }) {
             format: { type: "string", enum: ["jpeg", "png"], default: "jpeg" },
             width: { type: "integer", minimum: 1 },
             height: { type: "integer", minimum: 1 },
+            autoCrop: {
+              type: "boolean",
+              default: false,
+              description:
+                "OpenCV document edge detect + perspective crop (default off)",
+            },
+            deskew: {
+              type: "boolean",
+              default: false,
+              description:
+                "Perspective straighten; same pipeline as autoCrop when either is true",
+            },
           },
         },
         CaptureJson: {
@@ -191,6 +247,27 @@ export function buildOpenApi(opts: { title: string; version: string }) {
             serial: { type: "string" },
             encoding: { type: "string", example: "base64" },
             data: { type: "string", description: "Base64-encoded image bytes" },
+            postprocess: {
+              type: "object",
+              nullable: true,
+              properties: {
+                applied: { type: "boolean" },
+                method: { type: "string" },
+                sourceWidth: { type: "integer" },
+                sourceHeight: { type: "integer" },
+              },
+            },
+          },
+        },
+        LightRequest: {
+          type: "object",
+          properties: {
+            on: { type: "boolean" },
+            mode: {
+              type: "string",
+              enum: ["A", "B", "ON", "OFF"],
+              description: "Maps to vendor Set_Light_A / Set_Light_B when on Windows",
+            },
           },
         },
         Error: {

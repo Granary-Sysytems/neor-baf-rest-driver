@@ -1,10 +1,14 @@
 node_modules/
 dist/
+.venv/
 .env
 .DS_Store
 artifacts/*.jpg
 artifacts/*.jpeg
 artifacts/*.png
+artifacts/win-sdk-inspect/
 !artifacts/.gitkeep
 *.log
 .tsx-cache/
+__pycache__/
+*.pyc
