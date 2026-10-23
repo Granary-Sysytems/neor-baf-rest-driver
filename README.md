@@ -54,6 +54,7 @@ System Settings → Privacy & Security → Camera → allow **Terminal** (or the
 
 | Method | Path | Description |
 |--------|------|-------------|
+| `GET` | `/` | Local test UI (browser) |
 | `GET` | `/health` | Liveness |
 | `GET` | `/api/v1/devices` | List UVC / AVFoundation cameras |
 | `GET` | `/api/v1/devices/{serial}` | One device |
@@ -66,6 +67,8 @@ Errors:
 ```json
 { "error": { "code": "DEVICE_NOT_FOUND", "message": "..." } }
 ```
+
+Open the test page: [http://127.0.0.1:8787/](http://127.0.0.1:8787/)
 
 ### curl examples
 

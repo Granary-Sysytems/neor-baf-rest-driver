@@ -9,6 +9,20 @@ export function buildOpenApi(opts: { title: string; version: string }) {
     },
     servers: [{ url: "http://127.0.0.1:8787" }],
     paths: {
+      "/": {
+        get: {
+          summary: "Local test UI (HTML)",
+          operationId: "getTestUi",
+          responses: {
+            "200": {
+              description: "Single-page test console",
+              content: {
+                "text/html": { schema: { type: "string" } },
+              },
+            },
+          },
+        },
+      },
       "/health": {
         get: {
           summary: "Liveness probe",

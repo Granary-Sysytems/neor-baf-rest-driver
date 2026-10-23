@@ -1,3 +1,6 @@
+import { readFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import Fastify from "fastify";
 import type { AppConfig } from "./config.js";
 import { FfmpegAvfoundationAdapter } from "./device/ffmpeg-adapter.js";
@@ -5,6 +8,9 @@ import { AppError, toErrorBody } from "./errors.js";
 import { buildOpenApi } from "./openapi.js";
 import { deviceRoutes } from "./routes/devices.js";
 import { healthRoutes } from "./routes/health.js";
+
+const rootDir = join(dirname(fileURLToPath(import.meta.url)), "..");
+const testUiPath = join(rootDir, "public", "index.html");
 
 export async function buildServer(config: AppConfig) {
   const app = Fastify({
@@ -28,6 +34,11 @@ export async function buildServer(config: AppConfig) {
       app.log.error(err);
     }
     reply.status(status).send(body);
+  });
+
+  app.get("/", async (_req, reply) => {
+    const html = await readFile(testUiPath, "utf8");
+    return reply.type("text/html; charset=utf-8").send(html);
   });
 
   await app.register(healthRoutes);
